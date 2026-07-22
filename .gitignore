@@ -1,0 +1,10 @@
+# 快取與本機執行產生的檔案，不需要進版控
+_calendar_cache/
+monthly_report_log.txt
+monthly_report_run.log
+__pycache__/
+*.pyc
+
+# 每月實際產出的正式月報（含真實營運資料），預設不上傳到 repo
+# 若你想連同月報成品一起備份到 GitHub，把下面這行刪掉即可
+monthly_reports/monthly_*.md
