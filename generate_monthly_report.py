@@ -26,6 +26,7 @@ import json
 import glob
 import argparse
 import calendar
+import difflib
 import urllib.request
 from datetime import date, datetime
 from collections import OrderedDict
@@ -63,6 +64,8 @@ PROJECT_KEYWORDS = OrderedDict([
     ("ECOCO Chatbot", "ECOCO Chatbot 常見問題銀行版"),
     ("週報自動化", "週報自動化系統"),
     ("營運例會簡報自動化", "營運例會簡報自動化系統"),
+    ("商品包材出入庫表", "商品包材出入庫表系統"),
+    ("月報自動化", "月報自動化系統"),
 ])
 
 VALUE_PHRASE_BY_CATEGORY = {
@@ -81,6 +84,13 @@ PROJECT_CATEGORY = {
     "ECOCO Chatbot": "AI工具成果",
     "週報自動化": "AI工具成果",
     "營運例會簡報自動化": "AI工具成果",
+}
+
+# 指定專案固定顯示的工具名稱（當跨週工具不一致、或部分週報未標明工具時，仍以此為主）
+PROJECT_FORCED_TOOL = {
+    "ECOCO客訴分析平台": "Claude",
+    "商品包材出入庫表": "Claude",
+    "月報自動化": "Claude",
 }
 
 
@@ -183,7 +193,8 @@ def section_after(text, heading):
 
 
 def parse_pipe_table(block):
-    """解析 markdown 表格。可容忍儲存格內含未跳脫換行的情況（會自動合併回同一列）。"""
+    """解析 markdown 表格。可容忍儲存格內含未跳脫換行的情況（會自動合併回同一列），
+    也可容忍多打一個空白儲存格導致欄位數對不齊的情況（自動移除多餘的空白欄位）。"""
     lines = [l for l in block.strip().split("\n") if l.strip()]
     if len(lines) < 2 or not lines[0].strip().startswith("|"):
         return []
@@ -194,9 +205,16 @@ def parse_pipe_table(block):
     for line in lines[2:]:  # 跳過分隔線（---）
         buffer = (buffer + " " + line.strip()) if buffer else line.strip()
         cols = [c.strip() for c in buffer.strip().strip("|").split("|")]
-        if len(cols) >= ncol:
-            rows.append(dict(zip(header, cols[:ncol])))
-            buffer = ""
+        if len(cols) < ncol:
+            continue
+        if len(cols) > ncol:
+            non_empty = [c for c in cols if c != ""]
+            if len(non_empty) == ncol:
+                cols = non_empty  # 多出來的是空白欄位，移除後正好對齊，避免資料錯位
+            else:
+                cols = cols[:ncol]  # 無法判斷哪個是多餘欄位，退而求其次取前 ncol 個
+        rows.append(dict(zip(header, cols)))
+        buffer = ""
     return rows
 
 
@@ -313,10 +331,14 @@ def summarize_points(records, kw, max_points=2):
 
 
 def clean_bullet(text):
-    """清理三大成果句子：移除文字中殘留的省略號，確保有句尾標點"""
+    """清理三大成果句子：移除括號、省略號，修正標點殘留瑕疵，確保有句尾標點"""
     text = (text or "").strip()
+    text = strip_parens(text)
     text = text.replace("…", "")
-    text = text.strip()
+    text = re.sub(r"[：:]\s*[，、]", "：", text)  # 修正「：，」「：、」這類冒號後緊接多餘標點
+    text = re.sub(r"([，、])\s*\1+", r"\1", text)  # 修正連續重複的逗號／頓號
+    text = re.sub(r"^[：:，、\s]+", "", text)  # 開頭殘留的多餘標點
+    text = re.sub(r"\s+", " ", text).strip()
     if text and text[-1] not in "。！？」":
         text += "。"
     return text
@@ -325,6 +347,120 @@ def clean_bullet(text):
 # ============================================================
 # 彙整邏輯
 # ============================================================
+def dedupe_fuzzy(items, threshold=0.55):
+    """依文字相似度去重合併：若兩筆內容相似度達到門檻，視為同一件事，只保留較完整（較長）的版本。
+    threshold 越高代表要求越相似才會合併，避免誤把不相關的兩件事合併在一起。"""
+    kept = []
+    for it in items:
+        merged = False
+        for i, existing in enumerate(kept):
+            ratio = difflib.SequenceMatcher(None, it["text"], existing["text"]).ratio()
+            if ratio >= threshold:
+                if len(it["text"]) > len(existing["text"]):
+                    kept[i] = it  # 保留內容較完整的版本
+                merged = True
+                break
+        if not merged:
+            kept.append(it)
+    return kept
+
+
+# 週報裡常出現的人名／部門名稱（可自行增減）：用於「行政支援與其他事項」的人名合併與加註引號
+KNOWN_NAMES = [
+    "政偉", "忠翰", "書豪", "佳美", "冠翰", "鈺雯", "浩文", "陳熙", "欣妤", "雯瑛",
+    "Beryl", "Eva", "Ida", "Krystal", "Yu",
+]
+KNOWN_DEPTS = ["副總", "資訊部", "財務", "總經理室", "營運部", "行銷部", "研發部", "客服部"]
+
+
+def find_person_name(text):
+    """在文字中找出第一個符合已知人名清單的名字，找不到回傳 None"""
+    for name in KNOWN_NAMES:
+        if name in text:
+            return name
+    return None
+
+
+COMMON_NAME_TRAILING_WORDS = ["AI客服系統", "執行進度"]
+
+
+def strip_name_prefix(text, name):
+    """移除文字開頭的人名（含「實習生+姓名」寫法），以及緊接著的常見詞（如 AI客服系統、執行進度）"""
+    text = re.sub(r"^(實習生\s*)?" + re.escape(name) + r"\s*", "", text)
+    trailing_pattern = "|".join(re.escape(w) for w in COMMON_NAME_TRAILING_WORDS)
+    text = re.sub(r"^(?:{})[：:，、\s]*".format(trailing_pattern), "", text)
+    text = re.sub(r"^[：:，、\s]+", "", text)
+    return text.strip()
+
+
+def merge_by_person_name(items):
+    """只要提到同一個人名，就合併成一句：人名只在開頭標示一次，
+    每段內容開頭重複的人名／常見詞（如「AI客服系統」「實習生」）會先清除，避免重複顯示"""
+    named_groups = OrderedDict()
+    unnamed = []
+    for it in items:
+        name = find_person_name(it["text"])
+        if name:
+            named_groups.setdefault(name, []).append(it)
+        else:
+            unnamed.append(it)
+
+    merged = []
+    for name, group in named_groups.items():
+        context_label = None
+        for g in group:
+            for w in COMMON_NAME_TRAILING_WORDS:
+                if w in g["text"]:
+                    context_label = w
+                    break
+            if context_label:
+                break
+
+        seen_pieces = set()
+        pieces = []
+        for g in group:
+            stripped = strip_name_prefix(g["text"], name)
+            if stripped and stripped not in seen_pieces:
+                seen_pieces.add(stripped)
+                pieces.append(stripped)
+
+        prefix = "{}{}".format(name, context_label) if context_label else name
+        combined_text = "{}：{}".format(prefix, "；".join(pieces)) if pieces else name
+        merged.append({"week": group[-1]["week"], "text": combined_text})
+    merged.extend(unnamed)
+    return merged
+
+
+def quote_names(text):
+    """文字中提到的人名／部門名稱，加上「」標明"""
+    for name in sorted(KNOWN_NAMES + KNOWN_DEPTS, key=len, reverse=True):
+        quoted = "「{}」".format(name)
+        if name in text and quoted not in text:
+            text = text.replace(name, quoted)
+    return text
+
+
+def collect_other_items(weekly_records):
+    """從『本週完成工作』表格中蒐集「其他」項目的內容，依「；」拆成個別事項，
+    清理、依人名合併、去重（含模糊相似度合併）後回傳清單"""
+    seen = set()
+    items = []
+    for end_date, filename, text in weekly_records:
+        week_label = filename.replace("weekly_", "").replace(".md", "")
+        work_rows = parse_pipe_table(section_after(text, "## 本週完成工作"))
+        for row in work_rows:
+            if row.get("項目") != "其他":
+                continue
+            content = row.get("完成內容", "")
+            for piece in content.split("；"):
+                cleaned = strip_parens(clean_snippet(piece))
+                if cleaned and cleaned not in seen:
+                    seen.add(cleaned)
+                    items.append({"week": week_label, "text": cleaned})
+    items = merge_by_person_name(items)
+    return dedupe_fuzzy(items)
+
+
 def collect_project_progress(weekly_records):
     """依專案關鍵字，從『本週完成工作』與『下週工作計畫』表格中蒐集每週提及的進度片段"""
     progress = OrderedDict((k, []) for k in PROJECT_KEYWORDS)
@@ -410,6 +546,100 @@ def synthesize_narrative(records, kw):
     return "；".join(parts)
 
 
+def parse_date_loose(s):
+    """從不固定格式的日期文字中解析出日期，解析不出來回傳 None（例如「待確認」「2026/07/21~」等）"""
+    m = re.search(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})", s or "")
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+    return None
+
+
+TASK_CONTENT_KEYWORDS = [
+    "確認", "調整", "功能", "問題", "狀況", "系統", "優化", "建置", "流程", "申請",
+    "追蹤", "檢查", "匯出", "狀態", "事宜", "延遲", "異常", "設定", "區間", "版位",
+    "顯示", "資料", "退換貨", "外露", "更換", "紀錄", "傳送", "排程",
+]
+
+
+def looks_like_bare_name(text):
+    """粗略判斷這段文字是否只是人名（沒有描述具體協助內容）。
+    條件收得較嚴格，避免像「鈺雯粉專宣傳」這種本身就是任務描述的短句被誤判成人名：
+    - 含常見任務類關鍵字 → 一律視為任務內容，不是人名
+    - 含「/」「、」分隔多個姓名（如「忠翰/書豪」）→ 視為人名
+    - 或整段文字很短（4字以內，如「佳美」「冠翰」）→ 視為人名
+    """
+    if len(text) > 10:
+        return False
+    if any(k in text for k in TASK_CONTENT_KEYWORDS):
+        return False
+    if not re.fullmatch(r"[\u4e00-\u9fff／/、]+", text):
+        return False
+    if "／" in text or "/" in text or "、" in text:
+        return True
+    return len(text) <= 4
+
+
+def extract_name_from_dept(dept):
+    """從「部門(姓名)」這種寫法中取出姓名；沒有括號則原樣回傳"""
+    m = re.search(r"[（(]([^）)]+)[）)]", dept or "")
+    return m.group(1) if m else (dept or "")
+
+
+PLACEHOLDER_NO_CONTENT = "尚未於週報中記錄具體協助內容"
+
+
+def resolve_item_and_collaborator(item, dept):
+    """整理『項目』與『協作部門』：項目盡量顯示需協助的具體內容而非人名，協作部門盡量顯示人名。
+    若項目本身只是人名、找不到任何任務描述，項目欄位會誠實標註尚未記錄具體內容，不臆測填寫。"""
+    name_from_dept = extract_name_from_dept(dept)
+    if looks_like_bare_name(item) and name_from_dept == dept:
+        # 項目欄位其實只寫了人名，且協作部門也沒有可拆出的人名 → 把項目的人名搬到協作部門
+        return PLACEHOLDER_NO_CONTENT, item
+
+    # 「部門+姓名」黏在一起的寫法（例如項目欄寫「營運 忠翰/書豪」、部門欄寫「營運」）
+    if dept and item.startswith(dept):
+        remainder = item[len(dept):].strip()
+        if remainder and looks_like_bare_name(remainder):
+            return PLACEHOLDER_NO_CONTENT, remainder
+
+    return item, name_from_dept
+
+
+def merge_coordination_rows(rows):
+    """先解析出每一列真正的『項目內容』與『協作人名』（不管人名原本寫在項目欄還是部門欄），
+    再依解析後的結果合併——這樣同一個人即使各週欄位寫法不一致，也能正確合併成一筆。
+    若能解析出多個預計完成日，顯示成「預計M/D~M/D完成」的起訖日格式"""
+    resolved = []
+    for r in rows:
+        raw_item = strip_parens(clean_snippet(r.get("項目", "")))
+        raw_dept = r.get("協作部門", "") or "－"
+        item, collaborator = resolve_item_and_collaborator(raw_item, raw_dept)
+        resolved.append({"item": item, "dept": collaborator, "raw": r})
+
+    groups = OrderedDict()
+    for entry in resolved:
+        key = (entry["item"], entry["dept"])
+        groups.setdefault(key, []).append(entry["raw"])
+
+    merged = []
+    for (item, dept), group in groups.items():
+        dates = [d for d in (parse_date_loose(r.get("預計完成日", "")) for r in group) if d]
+        if dates:
+            dmin, dmax = min(dates), max(dates)
+            if dmin == dmax:
+                due_text = "預計{}/{}完成".format(dmin.month, dmin.day)
+            else:
+                due_text = "預計{}/{}~{}/{}完成".format(dmin.month, dmin.day, dmax.month, dmax.day)
+        else:
+            due_text = "預計完成日待確認"
+        status = group[-1].get("進度", "") or "進行中"  # 取最新一週的進度狀態
+        merged.append({"item": item, "dept": dept, "due_text": due_text, "status": status})
+    return merged
+
+
 def growth_text(records, kw=None):
     if not records:
         return "本月無相關進度紀錄"
@@ -462,20 +692,18 @@ def common_tool(records, kw):
 
 
 def format_column_pair(records, kw):
-    """組成『月初進度』『月底進度』欄位：內容前明確標示「月初：」「月底：」；
-    同一工具只在第一次出現時標示，避免同一列重複填寫工具名稱"""
+    """組成『月初進度』『月底進度』欄位內容：只放內容本身，不加「月初：」「月底：」標籤，
+    也不重複顯示工具名稱（工具名稱已顯示在『專案』欄位）。
+    若本月只有一筆資料，月初欄位留空，內容放在月底欄位。"""
+    def clean(text):
+        t = strip_project_name(text, kw)
+        _, rest = extract_tool_prefix(t)
+        return rest
+
     if len(records) == 1:
-        return "本月新增", "月底：{}".format(format_single_point(records[-1]["text"], kw))
+        return "", clean(records[-1]["text"])
 
-    tool = common_tool(records, kw)
-    if tool:
-        _, first_rest = extract_tool_prefix(strip_project_name(records[0]["text"], kw))
-        _, last_rest = extract_tool_prefix(strip_project_name(records[-1]["text"], kw))
-        return "月初：{}：{}".format(tool, first_rest), "月底：{}".format(last_rest)
-
-    first_point = format_single_point(records[0]["text"], kw)
-    last_point = format_single_point(records[-1]["text"], kw)
-    return "月初：{}".format(first_point), "月底：{}".format(last_point)
+    return clean(records[0]["text"]), clean(records[-1]["text"])
 
 
 def aggregate(weekly_records):
@@ -554,27 +782,41 @@ SHIPPING_PATTERN = re.compile(
 )
 SHIPPING_ORDER_COUNT_PATTERN = re.compile(r"(\d+)\s*筆")
 
+# 新寫法：「訂單共X筆」（不拆品項明細，直接採用這個數字）
+# 限定「商品包裝」附近才比對，避免誤抓瑕疵退換貨等其他情境的「訂單共X筆」
+SIMPLE_ORDER_PATTERN = re.compile(r"商品包裝[^\n]{0,15}?訂單共\s*(\d+)\s*筆")
+
 
 def aggregate_shipping_stats(weekly_records):
-    """掃描全部週報，加總出貨相關數字。
-    「彙整結果」後面可能列出一組或多組「X個：Y筆」（例如 W27 一次列 1個14筆、2個6筆、3個2筆），
-    訂單筆數需把每一組的筆數都加總；「總出貨數量Z個」= 正常出貨數量；
-    「+N個退貨補件」= 當週另外處理的退貨/補件數量；
-    「總出貨數量」最終應為 正常出貨數量 + 退貨補件數量 的合計。
+    """掃描全部週報，加總出貨相關數字，同時支援兩種寫法：
+    1.「彙整結果X個：Y筆...總出貨數量Z個(+N個退貨補件)」（可能一次列多組X個:Y筆，訂單筆數需全部加總）
+    2.「訂單共X筆」（不拆品項明細，直接採用該數字，同時計入訂單筆數與出貨數量）
     """
     total_orders = 0     # 訂單筆數加總（筆）
     total_shipped = 0    # 正常出貨數量加總（個）
     total_returns = 0    # 退貨／補件數量加總（個）
     found = False
     for _, _, text in weekly_records:
+        matched_spans = []
         for m in SHIPPING_PATTERN.finditer(text):
             found = True
+            matched_spans.append(m.span())
             detail = m.group(1)
             orders_this_match = sum(int(n) for n in SHIPPING_ORDER_COUNT_PATTERN.findall(detail))
             total_orders += orders_this_match
             total_shipped += int(m.group(2))
             if m.group(3):
                 total_returns += int(m.group(3))
+
+        for m in SIMPLE_ORDER_PATTERN.finditer(text):
+            # 避免跟上面「彙整結果...」格式重疊比對到同一段文字
+            if any(m.start() >= s and m.end() <= e for s, e in matched_spans):
+                continue
+            found = True
+            n = int(m.group(1))
+            total_orders += n
+            total_shipped += n
+
     combined_total = total_shipped + total_returns
     return {
         "found": found,
@@ -586,7 +828,7 @@ def aggregate_shipping_stats(weekly_records):
 
 
 def is_shipping_bullet(text):
-    return bool(SHIPPING_PATTERN.search(text))
+    return bool(SHIPPING_PATTERN.search(text) or SIMPLE_ORDER_PATTERN.search(text))
 
 
 def format_shipping_summary(stats):
@@ -598,15 +840,37 @@ def format_shipping_summary(stats):
     return base + "。"
 
 
+def mentioned_project(text):
+    """判斷文字中提到哪個 PROJECT_KEYWORDS 專案，找不到回傳 None"""
+    for kw in PROJECT_KEYWORDS:
+        bare = kw.replace("ECOCO", "")
+        if kw in text or bare in text:
+            return kw
+    return None
+
+
 def pick_top_bullets(all_bullets, top_n=3):
     classified = [(classify_bullet(text), week_label, text) for week_label, text in all_bullets]
 
     picked = []
+    picked_projects = set()  # 已選入的專案，避免同一個專案的舊資訊重複入選
+
+    def try_pick(candidates):
+        for c in candidates:
+            proj = mentioned_project(c[2])
+            if proj and proj in picked_projects:
+                continue  # 同一個專案已經選過一筆，跳過這筆避免重複主題
+            picked.append(c)
+            if proj:
+                picked_projects.add(proj)
+            return True
+        return False
+
     for category in PRIORITY_ORDER:
         candidates = [c for c in classified if c[0] == category]
         candidates.sort(key=lambda c: c[1], reverse=True)
         if candidates:
-            picked.append(candidates[0])
+            try_pick(candidates)
         if len(picked) >= top_n:
             break
 
@@ -616,7 +880,12 @@ def pick_top_bullets(all_bullets, top_n=3):
         for c in remaining:
             if len(picked) >= top_n:
                 break
+            proj = mentioned_project(c[2])
+            if proj and proj in picked_projects:
+                continue
             picked.append(c)
+            if proj:
+                picked_projects.add(proj)
 
     return picked[:top_n]
 
@@ -624,7 +893,7 @@ def pick_top_bullets(all_bullets, top_n=3):
 # ============================================================
 # 樣板組裝
 # ============================================================
-def build_monthly_markdown(year, month, week_labels, agg, project_progress, next_week_rows, shipping_stats):
+def build_monthly_markdown(year, month, week_labels, agg, project_progress, next_week_rows, shipping_stats, other_items):
     ct = agg["customer_totals"]
     all_tools_used = agg["ai_tools_used"] | set(agg["ai_tool_hours"].keys())
 
@@ -644,6 +913,10 @@ def build_monthly_markdown(year, month, week_labels, agg, project_progress, next
         highlight_rows.append("| AI客服自動回覆優化 | FB Meta Business AI 自動回覆率由 {:.1f}% 提升至 {:.1f}% | 進行中 | 月累計節省客服工時約 {:.1f} 小時 |".format(
             first_rate, last_rate, agg["total_saved_hours"]
         ))
+    if shipping_stats["found"]:
+        highlight_rows.append("| ECOCO商城商品包裝出貨 | 本月累計彙整訂單 {} 筆 | 進行中 | 支援商城訂單出貨作業 |".format(
+            shipping_stats["orders"]
+        ))
     for kw, display_name in PROJECT_KEYWORDS.items():
         records_all = project_progress.get(kw, [])
         if not records_all:
@@ -653,7 +926,7 @@ def build_monthly_markdown(year, month, week_labels, agg, project_progress, next
             last = records[-1]
             category = PROJECT_CATEGORY.get(kw, classify_bullet(last["text"]))
             completion = "100%" if ("100%" in (last["pct"] or "") or "完成" in (last["pct"] or "")) else (last["pct"] or "進行中")
-            result_text = summarize_points(records, kw, max_points=2)
+            _, result_text = format_column_pair(records, kw)  # 與「月底進度」保持一致，取最新內容
             highlight_rows.append("| {} | {} | {} | {} |".format(
                 name, result_text, completion, VALUE_PHRASE_BY_CATEGORY.get(category, "提升作業效率")
             ))
@@ -676,26 +949,30 @@ def build_monthly_markdown(year, month, week_labels, agg, project_progress, next
             continue
         for tag, records in split_by_version(records_all):
             name = display_name + tag if tag else display_name
+            tool = common_tool(records, kw)
+            if not tool and not tag and kw in PROJECT_FORCED_TOOL:
+                tool = PROJECT_FORCED_TOOL[kw]
+            label = "{}：{}".format(tool, name) if tool else name
             first_text, last_text = format_column_pair(records, kw)
-            project_lines.append("| {} | {} | {} | {} |".format(
-                name, first_text, last_text, growth_text(records, kw)
-            ))
+            project_lines.append("| {} | {} | {} |".format(label, first_text, last_text))
 
     # ---------- 跨部門合作成果 / 風險與待協調事項 ----------
     status_map = {"達成": "已完成", "完成": "已完成", "追蹤中": "追蹤中", "進行中": "進行中"}
     cross_dept_lines = []
     risk_lines = []
-    for r in agg["coordination_rows"]:
-        item = strip_parens(clean_snippet(r.get("項目", "")))
-        dept = r.get("協作部門", "") or "－"
-        raw_status = r.get("進度", "") or "進行中"
-        status = status_map.get(raw_status, raw_status)
-        due = r.get("預計完成日", "待確認") or "待確認"
+    merged_coordination = merge_coordination_rows(agg["coordination_rows"])
+    for m in merged_coordination:
+        item, dept, due_text = m["item"], m["dept"], m["due_text"]
+        status = status_map.get(m["status"], m["status"])
         if status == "已完成":
-            cross_dept_lines.append("| {} | {} | {} | {} |".format(item, dept, "已完成", status))
-        else:
-            cross_dept_lines.append("| {} | {} | 持續協調中 | {} |".format(item, dept, status))
-            risk_lines.append("| {} | {} | {} | {} |".format(item, item, dept, due))
+            # 跨部門合作成果只列真正已完成的項目，避免跟風險表重複列出進行中/追蹤中的事項
+            cross_dept_lines.append("| {} | {} | {} |".format(item, dept, "已完成"))
+        elif item != PLACEHOLDER_NO_CONTENT:
+            # 只有真的有記錄具體協助內容才列進風險表；純佔位（沒有內容）的不顯示，但仍計入合計數
+            risk_lines.append("| {} | {} | {} |".format(item, dept, due_text))
+
+    # ---------- 行政支援與其他事項 ----------
+    other_items_lines = ["- {}".format(quote_names(it["text"])) for it in other_items]
 
     # ---------- 本月三大貢獻 ----------
     top_bullets = pick_top_bullets(agg["all_bullets"], 3)
@@ -715,7 +992,7 @@ def build_monthly_markdown(year, month, week_labels, agg, project_progress, next
         plan_lines.append("| {} | {} | {} |".format(row.get("項目", "－"), goal, due))
 
     # ---------- 月度總結 ----------
-    resolved_count = sum(1 for r in agg["coordination_rows"] if status_map.get(r.get("進度", ""), r.get("進度", "")) == "已完成")
+    resolved_count = sum(1 for m in merged_coordination if status_map.get(m["status"], m["status"]) == "已完成")
 
     value_summary = (
         "本月客服案件量達 {total:.0f} 件，{trend}累計節省客服工時約 {hours:.1f} 小時，人力負擔持續降低。"
@@ -727,7 +1004,7 @@ def build_monthly_markdown(year, month, week_labels, agg, project_progress, next
         trend=rate_trend,
         hours=agg["total_saved_hours"],
         tool_count=len(all_tools_used),
-        coord_count=len(agg["coordination_rows"]),
+        coord_count=len(merged_coordination),
         resolved_count=resolved_count,
         unresolved_count=len(agg["coordination_rows"]) - resolved_count,
     )
@@ -742,7 +1019,7 @@ def build_monthly_markdown(year, month, week_labels, agg, project_progress, next
 
 ## 月度重點成果
 
-| 項目 | 成果 | 完成率 | 創造價值 |
+| 項目 | 成果 | 完成進度 | 創造價值 |
 | -- | -- | --- | ---- |
 {highlight_table}
 
@@ -759,7 +1036,6 @@ def build_monthly_markdown(year, month, week_labels, agg, project_progress, next
 | AI回覆率 | {ai_rate:.1f}% |
 | 追蹤案件 | {tracked:.0f} 件 |
 | 補點案件 | {refund:.0f} 件 |
-| 未結案件 | 資料未提供 |
 
 ---
 
@@ -778,17 +1054,23 @@ def build_monthly_markdown(year, month, week_labels, agg, project_progress, next
 
 ## 專案進度總覽
 
-| 專案 | 月初進度 | 月底進度 | 成長幅度 |
-| -- | ---- | ---- | ---- |
+| 專案 | 月初進度 | 月底進度 |
+| -- | ---- | ---- |
 {project_table}
 
 ---
 
 ## 跨部門合作成果
 
-| 專案 | 協作部門 | 完成成果 | 狀態 |
-| -- | ---- | ---- | -- |
+| 專案 | 協作部門 | 狀態 |
+| -- | ---- | -- |
 {cross_dept_table}
+
+---
+
+## 行政支援與其他事項
+
+{other_items_list}
 
 ---
 
@@ -808,8 +1090,8 @@ def build_monthly_markdown(year, month, week_labels, agg, project_progress, next
 
 ## 風險與待協調事項
 
-| 項目 | 影響範圍 | 協作部門 | 預計完成日 |
-| -- | ---- | ---- | ----- |
+| 項目 | 協作部門 | 預計完成日 |
+| -- | ---- | ----- |
 {risk_table}
 
 ---
@@ -849,13 +1131,14 @@ def build_monthly_markdown(year, month, week_labels, agg, project_progress, next
         ai_table="\n".join(ai_lines) if ai_lines else "| 無資料 | － | 0 |",
         total_hours=agg["total_saved_hours"],
         tool_count=len(all_tools_used),
-        project_table="\n".join(project_lines) if project_lines else "| 無符合關鍵字的專案紀錄 | － | － | － |",
-        cross_dept_table="\n".join(cross_dept_lines) if cross_dept_lines else "| 本月無跨部門合作紀錄 | － | － | － |",
+        project_table="\n".join(project_lines) if project_lines else "| 無符合關鍵字的專案紀錄 | － | － |",
+        cross_dept_table="\n".join(cross_dept_lines) if cross_dept_lines else "| 本月無已完成之跨部門合作項目 | － | － |",
+        other_items_list="\n".join(other_items_lines) if other_items_lines else "（本月「其他」欄位無額外事項）",
         contributions="\n".join(contribution_lines) if contribution_lines else "（本月無可分類的三大成果資料）",
         plan_table="\n".join(plan_lines) if plan_lines else "| 請參考本月最後一週週報之下週工作計畫 | － | 待確認 |",
-        risk_table="\n".join(risk_lines) if risk_lines else "| 本月無待協調事項 | － | － | － |",
+        risk_table="\n".join(risk_lines) if risk_lines else "| 本月無待協調事項 | － | － |",
         resolved_count=resolved_count,
-        coord_count=len(agg["coordination_rows"]),
+        coord_count=len(merged_coordination),
         value_summary=value_summary,
         gen_time=datetime.now().strftime("%Y-%m-%d %H:%M"),
     )
@@ -900,13 +1183,14 @@ def main():
     agg = aggregate(weekly_records)
     project_progress = collect_project_progress(weekly_records)
     shipping_stats = aggregate_shipping_stats(weekly_records)
+    other_items = collect_other_items(weekly_records)
 
     # 下月工作規劃：取本月最後一份週報的「下週工作計畫」表格
     last_text = weekly_records[-1][2]
     next_week_rows = parse_pipe_table(section_after(last_text, "## 下週工作計畫"))
 
     week_labels = [fn.replace("weekly_", "").replace(".md", "") for fn in week_files]
-    monthly_content = build_monthly_markdown(year, month, week_labels, agg, project_progress, next_week_rows, shipping_stats)
+    monthly_content = build_monthly_markdown(year, month, week_labels, agg, project_progress, next_week_rows, shipping_stats, other_items)
 
     os.makedirs(MONTHLY_REPORTS_DIR, exist_ok=True)
     output_path = os.path.join(MONTHLY_REPORTS_DIR, "monthly_{}-M{:02d}.md".format(year, month))
