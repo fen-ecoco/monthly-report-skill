@@ -1168,7 +1168,7 @@ def main():
             log("今天（{}）不是本月最後上班日（本月最後上班日為 {}），跳過執行。".format(
                 today.isoformat(), last_workday.isoformat() if last_workday else "無法判斷"
             ))
-            sys.exit(0)
+            sys.exit(2)  # exit code 2 = 今天跳過（非最後上班日），非錯誤
         log("今天（{}）確認為本月最後上班日，開始產出月報。".format(today.isoformat()))
         year, month = today.year, today.month
 

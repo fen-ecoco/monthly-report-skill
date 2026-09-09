@@ -5,17 +5,18 @@
 
 ## 一、安裝位置
 
-請將以下 3 個檔案放到：
+請將以下 4 個檔案放到：
 
 ```
 D:\info\0507_weekly-report-skill\monthly-report-skill\
-├── generate_monthly_report.py        ← 核心程式
-├── Run-MonthlyReport.ps1             ← PowerShell 執行包裝
+├── generate_monthly_report.py        ← 核心程式（產出月報）
+├── upload_monthly_report.py          ← 月報自動上傳至工作日誌系統（含真實 API Token，勿上傳 GitHub）
+├── Run-MonthlyReport.ps1             ← PowerShell 執行包裝（依序呼叫上面兩支程式）
 ├── Setup-TaskScheduler-Monthly.ps1   ← 排程設定（只需執行一次）
 ├── _calendar_cache\                  ← 政府行事曆快取（自動產生）
 ├── monthly_report_log.txt            ← 程式執行日誌（自動產生）
 └── monthly_reports\                  ← 月報成品存放處（自動產生）
-    └── monthly_2026-M07.md
+    └── monthly_2026-M08.md
 ```
 
 程式會自動讀取 `D:\info\0507_weekly-report-skill\reports\` 底下的 `weekly_*.md` 檔案，
@@ -101,7 +102,44 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 | `KNOWN_NAMES` / `KNOWN_DEPTS` | 「行政支援與其他事項」用於人名合併、人名/部門加註「」的清單 |
 | `CATEGORY_KEYWORDS` | 「新增/修復/優化」分類判斷關鍵字 |
 
-## 七、常見問題排除
+## 七、月報自動上傳至工作日誌系統
+
+月報產出成功後，`Run-MonthlyReport.ps1` 會自動接著呼叫 `upload_monthly_report.py`，
+把月報 MD 上傳到 ECOCO 工作日誌系統（`https://report-a.ecocogroup.com`）存為草稿。
+
+### 檔案與設定
+
+`upload_monthly_report.py` 裡的 `CONFIG` 需要填入：`api_token`（API Token）、`author_id`（你的使用者 ID）、
+`author_name`、`department`。這支腳本**含有真實 API Token，切勿上傳到 GitHub 或任何版本控制系統**，
+`.gitignore` 已將它排除；repo 裡只放了 `upload_monthly_report.py.example` 範本版（Token 為佔位符）。
+
+### 運作邏輯
+
+1. 讀取當月的 `monthly_YYYY-MXX.md`，把完整內容放進 `highlights` 欄位，`POST` 到 `/api/reports`
+2. 驗證方式為 `Authorization: Bearer <token>` + `X-Caller-Id: <author_id>`（不需要瀏覽器 Session Cookie）
+3. 若該期別（`period`）已經有報表存在，`API` 會回傳 `409` 衝突：
+   - 若為**草稿狀態** → 自動改用 `PATCH` 覆蓋更新
+   - 若為**審核中／已核准等非草稿狀態** → 跳出明顯的通知訊息，**不會覆蓋**，需自行至系統網頁確認處理
+
+### 手動測試
+
+```powershell
+cd "D:\info\0507_weekly-report-skill\monthly-report-skill"
+python upload_monthly_report.py 2026-08
+```
+
+### Exit code 對照表（供排程／自動化判斷用）
+
+| 腳本 | Exit code | 意義 |
+| --- | --- | --- |
+| `generate_monthly_report.py` | 0 | 成功產出月報 |
+| `generate_monthly_report.py` | 2 | 今天非本月最後上班日，正常跳過（非錯誤） |
+| `generate_monthly_report.py` | 1 | 執行錯誤（如找不到週報檔案） |
+| `upload_monthly_report.py` | 0 | 上傳／覆蓋成功 |
+| `upload_monthly_report.py` | 3 | 主動保護不覆蓋（既有報表非草稿狀態），正常情況，非錯誤 |
+| `upload_monthly_report.py` | 1 | 真正的上傳錯誤（如 Token 失效、網路問題） |
+
+## 八、常見問題排除
 
 | 問題 | 解決方式 |
 | --- | --- |
@@ -114,13 +152,14 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 | 想新增/修改可辨識的工具名稱 | 修改程式開頭 `KNOWN_TOOL_PREFIXES` 清單即可 |
 | 想新增可辨識的人名/部門 | 修改程式開頭 `KNOWN_NAMES` / `KNOWN_DEPTS` 清單即可 |
 | 同一件事在不同週描述文字差異較大，沒被合併 | 目前僅對「行政支援與其他事項」套用模糊相似度合併，「風險與待協調事項」尚未套用（可視需要再加） |
+| 月報上傳失敗 | 確認 `upload_monthly_report.py` 裡的 `api_token`／`author_id` 是否正確、Token 是否已過期 |
 
-## 八、費用
+## 九、費用
 
-完全免費。整個流程（判斷日期、下載政府行事曆、解析週報、產出月報）都在你自己的電腦上執行，
-不呼叫任何付費 API。
+完全免費。整個流程（判斷日期、下載政府行事曆、解析週報、產出月報、上傳草稿）都在你自己的電腦上執行，
+不呼叫任何付費 AI API（週/月報系統本身的 API 屬於公司內部系統，非本文所指的付費 AI API）。
 
-## 九、版本紀錄
+## 十、版本紀錄
 
 | 版本 | 日期 | 調整內容 |
 | --- | --- | --- |
@@ -136,7 +175,8 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 | v2.8 | 2026-08 | 移除全部括號、「新增/修復/優化」內容依關鍵字分類合併，不重複顯示分類關鍵字本身 |
 | v2.9 | 2026-08 | 月報輸出路徑改存至 `monthly_reports` 子資料夾 |
 | v3.0 | 2026-08 | 「跨部門合作成果」「風險與待協調事項」「專案進度總覽」表格欄位簡化（拿掉冗餘欄位）；新增「行政支援與其他事項」區塊，支援人名合併與模糊相似度去重；三大貢獻避免同一專案重複入選；新增 `PROJECT_FORCED_TOOL` 指定專案固定工具顯示 |
+| v3.1 | 2026-09 | 新增 `upload_monthly_report.py`：月報產出後自動上傳至 ECOCO 工作日誌系統（`report-a.ecocogroup.com`）存為草稿；處理該期別已有報表時的 409 衝突（草稿自動覆蓋、審核中／非草稿則跳出通知不覆蓋）；`generate_monthly_report.py` 的「非最後上班日跳過」情況改用 exit code 2、`upload_monthly_report.py` 的「主動保護不覆蓋」情況改用 exit code 3，兩者都與真正的錯誤（exit code 1）區分；`Run-MonthlyReport.ps1` 串接產出＋上傳兩步驟，並依 exit code 分別記錄對應的日誌訊息 |
 
 ---
 
-*最後更新：2026-08-31*
+*最後更新：2026-09-07*

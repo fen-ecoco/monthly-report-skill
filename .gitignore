@@ -8,3 +8,7 @@ __pycache__/
 # 每月實際產出的正式月報（含真實營運資料），預設不上傳到 repo
 # 若你想連同月報成品一起備份到 GitHub，把下面這行刪掉即可
 monthly_reports/monthly_*.md
+
+# 含真實 API Token 的檔案，切勿上傳到版本控制系統
+# repo 裡改放 upload_monthly_report.py.example（Token 為佔位符）供參考
+upload_monthly_report.py
