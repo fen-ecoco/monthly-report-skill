@@ -1,14 +1,13 @@
-# 快取與本機執行產生的檔案，不需要進版控
+# 執行時期產生的暫存/快取檔案，不需要進版控
 _calendar_cache/
 monthly_report_log.txt
 monthly_report_run.log
 __pycache__/
 *.pyc
 
-# 每月實際產出的正式月報（含真實營運資料），預設不上傳到 repo
-# 若你想連同月報成品一起備份到 GitHub，把下面這行刪掉即可
+# 每月實際月報內容屬於公司內部資料，不應該推上 GitHub，只保留範本
 monthly_reports/monthly_*.md
 
-# 含真實 API Token 的檔案，切勿上傳到版本控制系統
-# repo 裡改放 upload_monthly_report.py.example（Token 為佔位符）供參考
+# 含真實 API Token 的檔案，不能進版控
+# repo 裡放 upload_monthly_report.example.py（Token 為佔位符）
 upload_monthly_report.py
