@@ -636,7 +636,12 @@ def merge_coordination_rows(rows):
         else:
             due_text = "預計完成日待確認"
         status = group[-1].get("進度", "") or "進行中"  # 取最新一週的進度狀態
-        merged.append({"item": item, "dept": dept, "due_text": due_text, "status": status})
+        submit_dates = [d for d in (parse_date_loose(r.get("提出日期", "")) for r in group) if d]
+        if submit_dates:
+            submit_date_text = min(submit_dates).strftime("%Y/%m/%d")  # 取最早一週的提出日期
+        else:
+            submit_date_text = group[0].get("提出日期", "") or "－"
+        merged.append({"item": item, "dept": dept, "due_text": due_text, "status": status, "submit_date": submit_date_text})
     return merged
 
 
@@ -969,7 +974,7 @@ def build_monthly_markdown(year, month, week_labels, agg, project_progress, next
             cross_dept_lines.append("| {} | {} | {} |".format(item, dept, "已完成"))
         elif item != PLACEHOLDER_NO_CONTENT:
             # 只有真的有記錄具體協助內容才列進風險表；純佔位（沒有內容）的不顯示，但仍計入合計數
-            risk_lines.append("| {} | {} | {} |".format(item, dept, due_text))
+            risk_lines.append("| {} | {} | {} | {} | {} |".format(item, dept, m["submit_date"], due_text, status))
 
     # ---------- 行政支援與其他事項 ----------
     other_items_lines = ["- {}".format(quote_names(it["text"])) for it in other_items]
@@ -1090,8 +1095,8 @@ def build_monthly_markdown(year, month, week_labels, agg, project_progress, next
 
 ## 風險與待協調事項
 
-| 項目 | 協作部門 | 預計完成日 |
-| -- | ---- | ----- |
+| 項目 | 協作部門 | 提出日期 | 預計完成日 | 進度 |
+| -- | ---- | ----- | ----- | -- |
 {risk_table}
 
 ---
@@ -1136,7 +1141,7 @@ def build_monthly_markdown(year, month, week_labels, agg, project_progress, next
         other_items_list="\n".join(other_items_lines) if other_items_lines else "（本月「其他」欄位無額外事項）",
         contributions="\n".join(contribution_lines) if contribution_lines else "（本月無可分類的三大成果資料）",
         plan_table="\n".join(plan_lines) if plan_lines else "| 請參考本月最後一週週報之下週工作計畫 | － | 待確認 |",
-        risk_table="\n".join(risk_lines) if risk_lines else "| 本月無待協調事項 | － | － |",
+        risk_table="\n".join(risk_lines) if risk_lines else "| 本月無待協調事項 | － | － | － | － |",
         resolved_count=resolved_count,
         coord_count=len(merged_coordination),
         value_summary=value_summary,

@@ -6,14 +6,6 @@
 # with code 2 and generates nothing. On success it exits 0, and this wrapper then
 # uploads the generated report to ecowork and submits it for approval.
 
-# Force UTF-8 to avoid cp950 encoding errors (known issue on this machine)
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$OutputEncoding = [System.Text.Encoding]::UTF8
-chcp 65001 > $null
-
-# 強制 Python 子程序本身也用 UTF-8 輸出中文，避免 print() 用到系統 cp950 造成 log 亂碼
-$env:PYTHONIOENCODING = "utf-8"
-
 $BaseDir = "D:\info\0507_weekly-report-skill"
 $SkillDir = Join-Path $BaseDir "monthly-report-skill"
 $GenerateScript = Join-Path $SkillDir "generate_monthly_report.py"
@@ -27,7 +19,23 @@ if (-not (Test-Path $LogDir)) {
 $LogFile = Join-Path $LogDir "monthly_report_run.log"
 $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 
+# 先把「開始執行」寫進 log，確保就算後面任何一步出錯，至少留得下這次有被觸發過的紀錄
 Add-Content -Path $LogFile -Value "===== Run started: $Timestamp =====" -Encoding UTF8
+
+# Force UTF-8 to avoid cp950 encoding errors (known issue on this machine)
+# 用 try/catch 包起來：Task Scheduler 在非完全互動的工作階段觸發時，[Console]::OutputEncoding
+# 可能因為沒有真正附加的主控台 handle 而直接拋出例外（"The handle is invalid"），
+# 若不攔截，整支腳本會在這裡就終止，且完全不會留下任何 log（這正是 9/30 當天發生的狀況）。
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    $OutputEncoding = [System.Text.Encoding]::UTF8
+    chcp 65001 > $null
+} catch {
+    Add-Content -Path $LogFile -Value "提示：設定主控台 UTF-8 編碼失敗（非互動工作階段常見，可忽略）：$_" -Encoding UTF8
+}
+
+# 強制 Python 子程序本身也用 UTF-8 輸出中文，避免 print() 用到系統 cp950 造成 log 亂碼
+$env:PYTHONIOENCODING = "utf-8"
 
 $pythonExe = "python"
 
