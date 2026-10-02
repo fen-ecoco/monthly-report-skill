@@ -195,7 +195,7 @@ python upload_monthly_report.py 2026-08
 | v3.1 | 2026-09 | 新增 `upload_monthly_report.py`：月報產出後自動上傳至 ECOCO 工作日誌系統（`report-a.ecocogroup.com`）存為草稿；處理該期別已有報表時的 409 衝突（草稿自動覆蓋、審核中／非草稿則跳出通知不覆蓋）；`generate_monthly_report.py` 的「非最後上班日跳過」情況改用 exit code 2、`upload_monthly_report.py` 的「主動保護不覆蓋」情況改用 exit code 3，兩者都與真正的錯誤（exit code 1）區分；`Run-MonthlyReport.ps1` 串接產出＋上傳兩步驟，並依 exit code 分別記錄對應的日誌訊息 |
 | v3.2 | 2026-09 | **上傳目標由舊版週/月報系統（`report-a.ecocogroup.com`）遷移至 ecowork（`space.ecocogroup.com`）**：改用個人 API Token（PAT，需 `reports:read` + `reports:write` 權限，與週報 token 分開申請）；上傳流程改為四步驟（`GET periods` → `POST drafts` → `PATCH` 填內容 → `POST submit`），直接送出審核而非停在草稿；`content` 物件改用固定鍵 `"報表內容"`；新增必填的 `aiContribution` 欄位（固定文字說明使用規則式腳本、未用付費AI API）；修正 Cloudflare 403 Error 1010（補齊瀏覽器偽裝標頭）與 `urllib` 不會自動解壓縮 gzip/deflate 回應導致的 `UnicodeDecodeError` |
 | v3.3 | 2026-10 | 「風險與待協調事項」表格改回 **5 欄**（項目/協作部門/提出日期/預計完成日/進度），與週報原始表格欄位一致；`merge_coordination_rows()` 新增「提出日期」計算（跨週取最早一週的值）；修正 `Run-MonthlyReport.ps1` 在非完全互動的工作階段（如排程於電腦登入但非完全互動狀態下觸發）執行 `[Console]::OutputEncoding` 可能拋出例外導致整支腳本在寫入任何 log 之前就終止的問題（9/30 當月最後上班日排程即因此未能自動產出月報），改為 try/catch 包裹並提前寫入「開始執行」的 log 行 |
-
+| v3.4 | 2026-10 | 修正 Run-MonthlyReport.ps1 兩個排程層級的 bug：(1) 腳本檔案缺少 UTF-8 BOM，導致 Windows PowerShell 5.1 以系統內碼解析含中文的腳本時解析失敗，Task Scheduler 排程全程無聲失敗、無任何log（9/30、10/1 皆中招）——改存為帶 BOM 的 UTF-8；(2) Tee-Object 無 -Encoding 參數、預設編碼與旁邊 Add-Content -Encoding UTF8 不一致，造成 log 檔案編碼混亂讀取異常——改用變數接住 python 輸出後統一以 Add-Content -Encoding UTF8 寫入；新增月報產出成功後自動備份一份到本機 Google Drive 同步資料夾 D:\AI報告雲端備份（純複製檔案，同步由 Google Drive 桌面版處理，GitHub 維持原決定不放月報內容）
 ---
 
 *最後更新：2026-10-01*

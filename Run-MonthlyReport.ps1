@@ -1,4 +1,4 @@
-# Run-MonthlyReport.ps1
+﻿# Run-MonthlyReport.ps1
 # ECOCO Monthly Report Automation - Wrapper Script
 # Runs daily via Task Scheduler at 17:30.
 # The Python script itself checks whether today is the last workday of the month
@@ -40,14 +40,38 @@ $env:PYTHONIOENCODING = "utf-8"
 $pythonExe = "python"
 
 try {
-    & $pythonExe $GenerateScript 2>&1 | Tee-Object -FilePath $LogFile -Append
+    $genOutput = & $pythonExe $GenerateScript 2>&1
     $genExitCode = $LASTEXITCODE
+    if ($genOutput) { $genOutput | Add-Content -Path $LogFile -Encoding UTF8 }
 
     if ($genExitCode -eq 0) {
         Add-Content -Path $LogFile -Value "月報產出成功，接著上傳至 ecowork 並送出審核..." -Encoding UTF8
+
+        # 備份一份到 Google Drive 同步資料夾（純複製檔案，實際同步由 Google Drive 桌面版自行處理）
+        try {
+            $MonthId = Get-Date -Format "yyyy-MM"
+            $YearPart, $MonthPart = $MonthId -split "-"
+            $ReportFileName = "monthly_{0}-M{1}.md" -f $YearPart, $MonthPart
+            $ReportSourcePath = Join-Path $SkillDir "monthly_reports\$ReportFileName"
+            $DriveBackupDir = "D:\AI報告雲端備份"
+
+            if (Test-Path $ReportSourcePath) {
+                if (-not (Test-Path $DriveBackupDir)) {
+                    New-Item -ItemType Directory -Path $DriveBackupDir -Force | Out-Null
+                }
+                Copy-Item -Path $ReportSourcePath -Destination $DriveBackupDir -Force
+                Add-Content -Path $LogFile -Value "已備份月報至 Google Drive：$DriveBackupDir\$ReportFileName" -Encoding UTF8
+            } else {
+                Add-Content -Path $LogFile -Value "警告：找不到月報檔案，無法備份至 Google Drive：$ReportSourcePath" -Encoding UTF8
+            }
+        } catch {
+            Add-Content -Path $LogFile -Value "警告：備份至 Google Drive 失敗：$_" -Encoding UTF8
+        }
+
         if (Test-Path $UploadScript) {
-            & $pythonExe $UploadScript 2>&1 | Tee-Object -FilePath $LogFile -Append
+            $uploadOutput = & $pythonExe $UploadScript 2>&1
             $uploadExitCode = $LASTEXITCODE
+            if ($uploadOutput) { $uploadOutput | Add-Content -Path $LogFile -Encoding UTF8 }
             if ($uploadExitCode -eq 0) {
                 Add-Content -Path $LogFile -Value "上傳並送出審核成功。" -Encoding UTF8
             } elseif ($uploadExitCode -eq 3) {
