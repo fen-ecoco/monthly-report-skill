@@ -608,24 +608,122 @@ def resolve_item_and_collaborator(item, dept):
     return item, name_from_dept
 
 
+def _norm_coord_item(text):
+    """項目文字正規化：去掉「YYYY/MM/DD 提出」、標點與空白，方便比對各週寫法略有差異的同一件事"""
+    t = re.sub(r"\d{4}/\d{1,2}/\d{1,2}\s*提出", "", text or "")
+    return re.sub(r"[\W_]+", "", t.lower())
+
+
+def _coord_items_similar(a, b):
+    """判斷兩個協調項目是否為同一件事（只是各週文字略有增減）。
+    先比對文字相似度或包含關係，再用數字當保護：日期、數量不同的視為不同事項，
+    避免把「中秋連假10/1出貨」與「雙十連假10/15出貨」這類不同公告誤判成同一件。"""
+    na, nb = _norm_coord_item(a), _norm_coord_item(b)
+    if not na or not nb:
+        return False
+    short, long_ = (na, nb) if len(na) <= len(nb) else (nb, na)
+    contained = len(short) >= 10 and short in long_
+    ratio = difflib.SequenceMatcher(None, na, nb).ratio()
+    if not (contained or ratio >= 0.8):
+        return False
+    nums_a = set(re.findall(r"\d+", re.sub(r"\d{4}/\d{1,2}/\d{1,2}\s*提出", "", a or "")))
+    nums_b = set(re.findall(r"\d+", re.sub(r"\d{4}/\d{1,2}/\d{1,2}\s*提出", "", b or "")))
+    nums_short, nums_long = (nums_a, nums_b) if len(na) <= len(nb) else (nums_b, nums_a)
+    if contained:
+        return nums_short <= nums_long
+    return nums_a == nums_b
+
+
+COORD_MIN_COMMON = 5  # 「：」後面連續相同字數達此門檻，視為同一件事
+
+
+def _coord_body(text):
+    """取項目標題「：」後面的內容（前面的類別如「公益商家」「ecoco商城」不參與比對）；沒有冒號就用全文"""
+    t = re.sub(r"\d{4}/\d{1,2}/\d{1,2}\s*提出", "", text or "")
+    m = re.search(r"[：:]", t[:15])
+    if m:
+        t = t[m.end():]
+    t = re.sub(r"[\W_]+", "", t.lower())
+    # 沒有冒號的標題，開頭的類別詞（ecoco商城、公益商家、APP）不參與比對
+    for w in ("ecoco商城", "ecoco後台", "ecoco資料庫", "公益商家", "ecoco", "app"):
+        t = t.replace(w, "")
+    return t
+
+
+def _shares_long_substring(a, b, min_len=COORD_MIN_COMMON):
+    ta, tb = _coord_body(a), _coord_body(b)
+    if not ta or not tb:
+        return False
+    m = difflib.SequenceMatcher(None, ta, tb, autojunk=False).find_longest_match(0, len(ta), 0, len(tb))
+    return m.size >= min_len
+
+
 def merge_coordination_rows(rows):
     """先解析出每一列真正的『項目內容』與『協作人名』（不管人名原本寫在項目欄還是部門欄），
     再依解析後的結果合併——這樣同一個人即使各週欄位寫法不一致，也能正確合併成一筆。
+    規則：
+    1. 項目文字完全相同者合併成一筆，取最新一週的協作部門與進度、最早一週的提出日期
+    2. 尚未完成的項目之間，若文字相似（各週只是多寫或少寫幾句話），再合併成一筆，取最新一週的內容
+    3. 尚未完成的項目若與某個已完成項目文字相似，視為同一件事已完成，不再列入待協調事項
     若能解析出多個預計完成日，顯示成「預計M/D~M/D完成」的起訖日格式"""
+    done_values = ("已完成", "達成", "完成")
+
     resolved = []
-    for r in rows:
+    for idx, r in enumerate(rows):
         raw_item = strip_parens(clean_snippet(r.get("項目", "")))
         raw_dept = r.get("協作部門", "") or "－"
         item, collaborator = resolve_item_and_collaborator(raw_item, raw_dept)
-        resolved.append({"item": item, "dept": collaborator, "raw": r})
+        resolved.append({"item": item, "dept": collaborator, "raw": r, "idx": idx})
 
-    groups = OrderedDict()
+    # 第一步：項目文字完全相同者先合併；純佔位（沒有具體內容、只有人名）的依人名分開
+    exact_groups = OrderedDict()
     for entry in resolved:
-        key = (entry["item"], entry["dept"])
-        groups.setdefault(key, []).append(entry["raw"])
+        if entry["item"] == PLACEHOLDER_NO_CONTENT:
+            key = (entry["item"], entry["dept"])
+        else:
+            key = (entry["item"],)
+        exact_groups.setdefault(key, []).append(entry)
+
+    def is_done(entries):
+        return (entries[-1]["raw"].get("進度", "") or "") in done_values
+
+    done_groups = [g for g in exact_groups.values() if is_done(g)]
+    open_groups = [g for g in exact_groups.values() if not is_done(g)]
+
+    # 第二步：尚未完成的項目之間，文字相似者再合併（佔位項目不參與）
+    clusters = []
+    for g in open_groups:
+        if g[0]["item"] == PLACEHOLDER_NO_CONTENT:
+            clusters.append(list(g))
+            continue
+        for c in clusters:
+            if c[0]["item"] != PLACEHOLDER_NO_CONTENT and any(
+                _coord_items_similar(g[0]["item"], e["item"]) or _shares_long_substring(g[0]["item"], e["item"]) for e in c
+            ):
+                c.extend(g)
+                c.sort(key=lambda e: e["idx"])
+                break
+        else:
+            clusters.append(list(g))
+
+    # 第三步：與已完成項目文字相似的未完成項目，視為同一件事已完成，剔除
+    done_texts = [g[0]["item"] for g in done_groups if g[0]["item"] != PLACEHOLDER_NO_CONTENT]
+    kept_clusters = []
+    for c in clusters:
+        if c[0]["item"] != PLACEHOLDER_NO_CONTENT and any(
+            _coord_items_similar(e["item"], d) or _shares_long_substring(e["item"], d)
+            for e in c for d in done_texts
+        ):
+            continue
+        kept_clusters.append(c)
 
     merged = []
-    for (item, dept), group in groups.items():
+    for entries in done_groups + kept_clusters:
+        entries = sorted(entries, key=lambda e: e["idx"])
+        latest = entries[-1]
+        item = latest["item"]
+        dept = latest["dept"]  # 取最新一週的協作部門
+        group = [e["raw"] for e in entries]
         dates = [d for d in (parse_date_loose(r.get("預計完成日", "")) for r in group) if d]
         if dates:
             dmin, dmax = min(dates), max(dates)
@@ -641,7 +739,12 @@ def merge_coordination_rows(rows):
             submit_date_text = min(submit_dates).strftime("%Y/%m/%d")  # 取最早一週的提出日期
         else:
             submit_date_text = group[0].get("提出日期", "") or "－"
-        merged.append({"item": item, "dept": dept, "due_text": due_text, "status": status, "submit_date": submit_date_text})
+        merged.append({"item": item, "dept": dept, "due_text": due_text, "status": status,
+                       "submit_date": submit_date_text, "_order": entries[0]["idx"]})
+
+    merged.sort(key=lambda m: m["_order"])
+    for m in merged:
+        m.pop("_order", None)
     return merged
 
 
@@ -939,7 +1042,18 @@ def build_monthly_markdown(year, month, week_labels, agg, project_progress, next
     # ---------- AI導入效益 ----------
     ai_lines = []
     for tool, hours in agg["ai_tool_hours"].items():
-        notes = strip_parens("；".join(n for n in agg["ai_tool_notes"].get(tool, []) if n))
+        week_notes = [n for n in agg["ai_tool_notes"].get(tool, []) if n]
+        # 各週成果寫的是「自動回覆X件客服案件」：把全部週數的件數加總成一個數字顯示
+        reply_counts = []
+        for n in week_notes:
+            mm = re.search(r"自動回覆\s*(\d+)\s*件", n)
+            if mm:
+                reply_counts.append(int(mm.group(1)))
+        if reply_counts and len(reply_counts) == len(week_notes):
+            notes = "自動回覆{}件客服案件".format(sum(reply_counts))
+        else:
+            # 有任何一週格式對不上時，不硬湊數字，維持原本逐週列出的寫法
+            notes = strip_parens("；".join(week_notes))
         ai_lines.append("| {} | {} | 約 {:.1f} 小時 |".format(tool, notes or "－", hours))
     for tool in agg["ai_tools_used"]:
         if tool in agg["ai_tool_hours"]:
@@ -1011,7 +1125,7 @@ def build_monthly_markdown(year, month, week_labels, agg, project_progress, next
         tool_count=len(all_tools_used),
         coord_count=len(merged_coordination),
         resolved_count=resolved_count,
-        unresolved_count=len(agg["coordination_rows"]) - resolved_count,
+        unresolved_count=len(merged_coordination) - resolved_count,
     )
 
     md = """# 【月報】{year}年{month:02d}月｜行銷客服營運分析助理
@@ -1153,6 +1267,46 @@ def build_monthly_markdown(year, month, week_labels, agg, project_progress, next
 # ============================================================
 # 主流程
 # ============================================================
+def tidy_punctuation(markdown_text):
+    """最後一道標點整理：中文語境中的半形標點改全形、移除多餘或重複的標點與空白、
+    去掉儲存格開頭與結尾多餘的標點。網址與數字（如10:30、1,000）不會被更動。"""
+    cjk = "\u4e00-\u9fff"
+    out = []
+    for line in markdown_text.split("\n"):
+        if re.match(r"^\s*\|?[\s\-:|]+\|?\s*$", line) and "-" in line:
+            out.append(line)  # 表格分隔線不處理
+            continue
+        if "http" in line:
+            head = line
+            urls = re.findall(r"https?://\S+", line)
+            for i, u in enumerate(urls):
+                head = head.replace(u, "\x00{}\x00".format(i), 1)
+        else:
+            urls, head = [], line
+        t = head
+        # 半形標點改全形（需緊鄰中文，且不是數字之間的）
+        t = re.sub(r"(?<=[{c}]),(?!\d)|(?<=[{c}]),(?=\d)".format(c=cjk), "，", t)
+        t = re.sub(r"(?<=[{c}]);".format(c=cjk), "；", t)
+        t = re.sub(r"(?<=[{c}]):(?!\d)".format(c=cjk), "：", t)
+        t = re.sub(r"(?<=[{c}])\?".format(c=cjk), "？", t)
+        t = re.sub(r"(?<=[{c}])!".format(c=cjk), "！", t)
+        t = re.sub(r"[ \t]*([，。；：、？！])[ \t]*", r"\1", t)  # 全形標點前後不留空白
+        t = re.sub(r"([，；、：])\1+", r"\1", t)
+        t = re.sub(r"。{2,}", "。", t)
+        t = re.sub(r"[，；、：]+(?=。)", "", t)  # 「，。」→「。」
+        t = re.sub(r"[，、；]{2,}", lambda m: m.group(0)[-1], t)  # 混合連續標點取最後一個
+        t = re.sub(r"[，、；：]+(?=\s*(\||$))", "", t)  # 儲存格或行尾多餘標點
+        t = re.sub(r"(\|\s*)[，、；。：]+", r"\1", t)  # 儲存格開頭多餘標點
+        for i, u in enumerate(urls):
+            t = t.replace("\x00{}\x00".format(i), u, 1)
+        if t.lstrip().startswith("|"):
+            t = re.sub(r"[ \t]*\|[ \t]*", " | ", t.strip())
+            t = t.replace("|  |", "| |")
+            t = t.strip()
+        out.append(t)
+    return "\n".join(out)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--force", action="store_true", help="忽略「是否為最後上班日」的判斷，直接執行")
@@ -1197,6 +1351,7 @@ def main():
     week_labels = [fn.replace("weekly_", "").replace(".md", "") for fn in week_files]
     monthly_content = build_monthly_markdown(year, month, week_labels, agg, project_progress, next_week_rows, shipping_stats, other_items)
 
+    monthly_content = tidy_punctuation(monthly_content)
     os.makedirs(MONTHLY_REPORTS_DIR, exist_ok=True)
     output_path = os.path.join(MONTHLY_REPORTS_DIR, "monthly_{}-M{:02d}.md".format(year, month))
     with open(output_path, "w", encoding="utf-8") as f:
